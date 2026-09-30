@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import type { FuzzLevel } from '@flil/shared';
 import { getDb, newId, nowIso } from '../db.js';
 import { config } from '../config.js';
-import { errors } from '../http/errors.js';
+import { errors, type ApiError } from '../http/errors.js';
 import { assertShareFuzzLevel, isShareFuzzLevelAllowed } from './fuzzing.js';
 
 export interface ShareLinkRow {
@@ -60,30 +60,71 @@ export function createShareLink(params: {
   return getDb().prepare('SELECT * FROM share_link WHERE id = ?').get(id) as ShareLinkRow;
 }
 
-/** 校验分享令牌：撤销、过期、密码三者都必须校验（文档 13.4） */
-export function validateShareToken(token: string, password?: string | null): ShareLinkRow {
+export type ShareDenyReason =
+  | 'revoked'
+  | 'expired'
+  | 'password_required'
+  | 'password_wrong'
+  | 'fuzz_level_too_precise';
+
+/**
+ * 分享访问的唯一准入闸门。
+ * 一次评估撤销、过期、密码和模糊级别，避免各路由各查一项导致绕过；
+ * 拒绝时把全部命中的拒绝原因写入同一条审计。
+ */
+export function authorizeShareToken(token: string, password?: string | null): ShareLinkRow {
   const row = getDb().prepare('SELECT * FROM share_link WHERE token = ?').get(token) as ShareLinkRow | undefined;
   if (!row) throw errors.notFound('分享链接');
 
-  if (row.revoked_at) {
+  const reasons = shareAccessDenialReasons(row, password);
+  if (reasons.length > 0) {
+    logAccess(row.id, false, reasons.join(','));
+    throw shareAccessError(reasons);
+  }
+  return row;
+}
+
+/**
+ * 异步生成分享图后必须再次调用。better-sqlite3 调用本身是同步的，因此这里与后续读图之间
+ * 不会插入撤销操作，关闭“校验通过后、发图前被并发撤销”的时间窗。
+ */
+export function assertShareAccessCurrent(row: ShareLinkRow): void {
+  const latest = getDb().prepare('SELECT * FROM share_link WHERE id = ?').get(row.id) as ShareLinkRow | undefined;
+  if (!latest) {
     logAccess(row.id, false, 'revoked');
     throw errors.shareRevoked();
   }
-  if (new Date(row.expires_at).getTime() < Date.now()) {
-    logAccess(row.id, false, 'expired');
-    throw errors.shareExpired();
+
+  const reasons = shareAccessDenialReasons(latest, null).filter(
+    (reason) => reason !== 'password_required' && reason !== 'password_wrong',
+  );
+  if (reasons.length > 0) {
+    logAccess(latest.id, false, reasons.join(','));
+    throw shareAccessError(reasons);
   }
+}
+
+function shareAccessDenialReasons(row: ShareLinkRow, password?: string | null): ShareDenyReason[] {
+  const reasons: ShareDenyReason[] = [];
+  if (row.revoked_at) reasons.push('revoked');
+  if (new Date(row.expires_at).getTime() < Date.now()) reasons.push('expired');
+
   if (row.password_hash) {
-    if (!password) {
-      logAccess(row.id, false, 'password_required');
-      throw errors.sharePasswordRequired();
-    }
-    if (!bcrypt.compareSync(password, row.password_hash)) {
-      logAccess(row.id, false, 'password_wrong');
-      throw errors.sharePasswordRequired();
-    }
+    if (!password) reasons.push('password_required');
+    else if (!bcrypt.compareSync(password, row.password_hash)) reasons.push('password_wrong');
   }
-  return row;
+
+  if (!isShareFuzzLevelAllowed(row.fuzz_level)) reasons.push('fuzz_level_too_precise');
+  return reasons;
+}
+
+function shareAccessError(reasons: ShareDenyReason[]): ApiError {
+  if (reasons.includes('revoked')) return errors.shareRevoked();
+  if (reasons.includes('expired')) return errors.shareExpired();
+  if (reasons.includes('password_required') || reasons.includes('password_wrong')) {
+    return errors.sharePasswordRequired();
+  }
+  return errors.fuzzTooPrecise();
 }
 
 export function logAccess(shareLinkId: string, allowed: boolean, denyReason?: string): void {

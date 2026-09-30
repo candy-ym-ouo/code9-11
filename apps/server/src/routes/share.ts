@@ -14,7 +14,8 @@ import {
   logAccess,
   revokeShareLink,
   shareStatus,
-  validateShareToken,
+  authorizeShareToken,
+  assertShareAccessCurrent,
 } from '../services/share.js';
 import { albumItemsDetailed, getSnapshot } from '../services/albums.js';
 import { requireInspiration } from '../services/inspirations.js';
@@ -23,6 +24,11 @@ import { shareImageFor, type AssetRow } from '../services/assets.js';
 
 export const shareRouter = Router();
 export const publicShareRouter = Router();
+
+publicShareRouter.use((_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 shareRouter.use(authenticate());
 
@@ -125,12 +131,12 @@ function passwordFrom(req: { query: unknown; header: (n: string) => string | und
 
 /**
  * 只读分享视图（无需登录）。
- * 输出中**只有模糊坐标**，并且每次请求都会重新校验撤销与过期（不接受缓存兜底）。
+ * 输出中**只有模糊坐标**，并且每次请求都会在同一闸门内复查撤销、过期、密码与模糊级别（不接受缓存兜底）。
  */
 publicShareRouter.get(
   '/share/:token',
   ah(async (req, res) => {
-    const link = validateShareToken(req.params.token, passwordFrom(req));
+    const link = authorizeShareToken(req.params.token, passwordFrom(req));
     const ctx = {
       libraryId: link.library_id,
       role: 'member' as const,
@@ -180,11 +186,11 @@ publicShareRouter.get(
   }),
 );
 
-/** 分享图：二次脱敏（剥离 EXIF）后输出，且每次校验撤销/过期 */
+/** 分享图：二次脱敏（剥离 EXIF）后输出；发图前再次校验撤销/过期/模糊级别 */
 publicShareRouter.get(
   '/share/:token/assets/:assetId',
   ah(async (req, res) => {
-    const link = validateShareToken(req.params.token, passwordFrom(req));
+    const link = authorizeShareToken(req.params.token, passwordFrom(req));
     const db = getDb();
     const asset = db.prepare('SELECT * FROM asset WHERE id = ?').get(req.params.assetId) as AssetRow | undefined;
     if (!asset) throw errors.notFound('图片');
@@ -206,9 +212,13 @@ publicShareRouter.get(
     }
 
     const target = await shareImageFor(asset, link.library_id);
+    // 异步生成脱敏图期间可能发生撤销/过期；发图前在同一同步段内复查并读取文件，
+    // 避免复查后到 res.sendFile 异步发文件之间再次出现竞争窗口。
+    assertShareAccessCurrent(link);
     if (!fs.existsSync(target)) throw errors.notFound('图片文件');
+    const image = fs.readFileSync(target);
     logAccess(link.id, true);
-    res.sendFile(target);
+    res.type('jpg').send(image);
   }),
 );
 
@@ -216,7 +226,7 @@ publicShareRouter.post(
   '/share/:token/verify',
   ah(async (req, res) => {
     const { password } = z.object({ password: z.string().nullable().optional() }).parse(req.body ?? {});
-    const link = validateShareToken(req.params.token, password ?? null);
+    const link = authorizeShareToken(req.params.token, password ?? null);
     ok(res, { ok: true, scope: link.scope, fuzzLevel: link.fuzz_level, expiresAt: link.expires_at });
   }),
 );
