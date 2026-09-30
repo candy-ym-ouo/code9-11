@@ -1,9 +1,27 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Express } from 'express';
 import request from 'supertest';
+import sharp from 'sharp';
+
+// 在"初次校验通过 → 读图字节"之间注入可配置延迟，用于确定性复现并发撤销窗口。
+// 默认 0，不影响其它用例；并发撤销用例临时置为 150ms。
+const shareGate = vi.hoisted(() => ({ shareImageDelayMs: 0 }));
+vi.mock('../src/services/assets.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/assets.js')>();
+  return {
+    ...actual,
+    shareImageFor: async (...args: Parameters<typeof actual.shareImageFor>) => {
+      const target = await actual.shareImageFor(...args);
+      if (shareGate.shareImageDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, shareGate.shareImageDelayMs));
+      }
+      return target;
+    },
+  };
+});
 
 let app: Express;
 let token = '';
@@ -376,6 +394,123 @@ describe('E7 隐私：模糊化、强制降级与撤销', () => {
     expect(preview.body.precise.lat).toBe(31.2471);
     expect(preview.body.fuzz.geohash).toBeTruthy();
     expect(preview.body.fuzz.lat).not.toBeNull();
+  });
+
+  it('一次校验处理密码/过期/模糊级别，且每条拒绝原因都进入审计', async () => {
+    // 新建带密码的灵感分享（过期与撤销用同一个链接依次构造）
+    const created = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: cardId,
+      fuzzLevel: 'g1k',
+      expiresInDays: 1,
+      password: 'abc-123',
+    });
+    expect(created.status).toBe(201);
+    const pwToken: string = created.body.token;
+    const pwLinkId: string = created.body.id;
+
+    const saved = token;
+    token = '';
+
+    // ① 缺密码
+    const noPwd = await call('get', `/api/share/${pwToken}`);
+    expect(noPwd.status).toBe(401);
+    expect(noPwd.body.error.code).toBe('SHARE_PASSWORD_REQUIRED');
+
+    // ② 密码错误
+    const wrongPwd = await call('get', `/api/share/${pwToken}?password=nope`);
+    expect(wrongPwd.status).toBe(401);
+    expect(wrongPwd.body.error.code).toBe('SHARE_PASSWORD_REQUIRED');
+
+    token = saved;
+    // ③ 过期：直接把到期时间拨到过去
+    const { getDb } = await import('../src/db.js');
+    getDb()
+      .prepare("UPDATE share_link SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+      .run(pwLinkId);
+    token = '';
+    const expired = await call('get', `/api/share/${pwToken}?password=abc-123`);
+    expect(expired.status).toBe(401);
+    expect(expired.body.error.code).toBe('SHARE_EXPIRED');
+    token = saved;
+
+    // ④ 模糊级别：即使历史脏数据把级别改成 g100（建表 CHECK 只拦 exact），读时也必须拒绝
+    getDb()
+      .prepare("UPDATE share_link SET expires_at = '2099-01-01T00:00:00.000Z', fuzz_level = 'g100' WHERE id = ?")
+      .run(pwLinkId);
+    token = '';
+    const tooPrecise = await call('get', `/api/share/${pwToken}?password=abc-123`);
+    expect(tooPrecise.status).toBe(400);
+    expect(tooPrecise.body.error.code).toBe('FUZZ_LEVEL_TOO_PRECISE');
+    token = saved;
+
+    // 审计：四种拒绝原因都必须落库
+    const logs = await call('get', `/api/share-links/${pwLinkId}/logs`);
+    const reasons = (logs.body.items as { allowed: number; deny_reason: string | null }[]).map((l) =>
+      l.allowed === 0 ? l.deny_reason : null,
+    );
+    expect(reasons).toContain('password_required');
+    expect(reasons).toContain('password_wrong');
+    expect(reasons).toContain('expired');
+    expect(reasons).toContain('fuzz_level');
+  });
+
+  it('并发撤销：图片转码期间撤销链接，任何响应都不得带出图片字节', async () => {
+    // 1) 给灵感卡上传一张图片
+    const png: Buffer = await sharp({
+      create: { width: 64, height: 64, channels: 3, background: { r: 200, g: 100, b: 50 } },
+    })
+      .png()
+      .toBuffer();
+    const upload = await request(app)
+      .post(`/api/inspirations/${cardId}/assets`)
+      .set('authorization', `Bearer ${token}`)
+      .attach('files', png, 'race.png');
+    expect(upload.status).toBe(201);
+    const assetId: string = upload.body.items[0].assetId;
+
+    // 2) 新建无密码分享
+    const created = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: cardId,
+      fuzzLevel: 'g1k',
+      expiresInDays: 1,
+    });
+    const raceToken: string = created.body.token;
+    const raceLinkId: string = created.body.id;
+
+    // 3) 在"初次校验通过 → 读图"之间人为撑开一个确定性的异步窗口，
+    //    模拟分享图转码耗时；窗口内由 owner 撤销链接。
+    shareGate.shareImageDelayMs = 150;
+    try {
+      const pending = request(app).get(`/api/share/${raceToken}/assets/${assetId}`);
+      await new Promise((r) => setTimeout(r, 80)); // 等请求进入转码窗口
+      const revoke = await call('post', `/api/share-links/${raceLinkId}/revoke`, {});
+      expect(revoke.status).toBe(200);
+      const res = await pending;
+
+      // 撤销生效：401 + JSON 错误，响应里绝不能带 image/jpeg 的图片字节
+      expect(res.status).toBe(401);
+      expect(String(res.headers['content-type'])).toContain('application/json');
+      expect(res.body?.error?.code).toBe('SHARE_REVOKED');
+    } finally {
+      shareGate.shareImageDelayMs = 0;
+    }
+
+    // 撤销之后再次请求图片同样被拒
+    const saved = token;
+    token = '';
+    const after = await request(app).get(`/api/share/${raceToken}/assets/${assetId}`);
+    expect(after.status).toBe(401);
+    expect(after.body?.error?.code).toBe('SHARE_REVOKED');
+    token = saved;
+
+    // 审计中应能看到撤销拒绝（转码窗口内 1 次 + 撤销后 1 次）
+    const logs = await call('get', `/api/share-links/${raceLinkId}/logs`);
+    const reasons = (logs.body.items as { allowed: number; deny_reason: string | null }[]).map((l) =>
+      l.allowed === 0 ? l.deny_reason : null,
+    );
+    expect(reasons.filter((r) => r === 'revoked').length).toBeGreaterThanOrEqual(2);
   });
 });
 

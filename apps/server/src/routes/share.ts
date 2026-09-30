@@ -8,6 +8,7 @@ import { authenticate } from '../http/middleware.js';
 import { ctxOf } from '../http/context.js';
 import { errors } from '../http/errors.js';
 import {
+  assertShareStillActive,
   createShareLink,
   listAccessLogs,
   listShareLinks,
@@ -23,6 +24,13 @@ import { shareImageFor, type AssetRow } from '../services/assets.js';
 
 export const shareRouter = Router();
 export const publicShareRouter = Router();
+
+// 分享响应一律不进浏览器/代理缓存：撤销后任何端都不得再从缓存"读图"。
+publicShareRouter.use((_req, res, next) => {
+  res.set('Cache-Control', 'private, no-store, max-age=0');
+  res.set('Pragma', 'no-cache');
+  next();
+});
 
 shareRouter.use(authenticate());
 
@@ -125,7 +133,8 @@ function passwordFrom(req: { query: unknown; header: (n: string) => string | und
 
 /**
  * 只读分享视图（无需登录）。
- * 输出中**只有模糊坐标**，并且每次请求都会重新校验撤销与过期（不接受缓存兜底）。
+ * validateShareToken 在一次校验内处理撤销、过期、模糊级别与密码，拒绝原因落审计；
+ * 输出中**只有模糊坐标**，并且每次请求都重新读库校验（不接受缓存兜底）。
  */
 publicShareRouter.get(
   '/share/:token',
@@ -180,7 +189,12 @@ publicShareRouter.get(
   }),
 );
 
-/** 分享图：二次脱敏（剥离 EXIF）后输出，且每次校验撤销/过期 */
+/**
+ * 分享图：二次脱敏（剥离 EXIF）后输出。
+ * 并发安全（文档 13.4）：初次校验后转码存在 await，撤销可能在此期间发生，
+ * 因此在最后一个 await 之后、读取任何图片字节之前同步复核撤销/过期；
+ * 随后同步把文件读入内存再发送，杜绝 sendFile 打开文件前的异步窗口。
+ */
 publicShareRouter.get(
   '/share/:token/assets/:assetId',
   ah(async (req, res) => {
@@ -206,9 +220,11 @@ publicShareRouter.get(
     }
 
     const target = await shareImageFor(asset, link.library_id);
-    if (!fs.existsSync(target)) throw errors.notFound('图片文件');
+    // —— 最后一个 await，之后全部同步 ——
+    assertShareStillActive(link);
+    const bytes = fs.readFileSync(target);
     logAccess(link.id, true);
-    res.sendFile(target);
+    res.type('image/jpeg').send(bytes);
   }),
 );
 
